@@ -1,0 +1,45 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "my-lawyer-bot",
+  "main": ".build/worker.js",
+  "compatibility_date": "2026-09-22",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "workers_dev": true,
+  "dev": {
+    "port": 8787
+  },
+  "vars": {
+    "OPENAI_MODEL": "gpt-5.6-terra"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CONVERSATIONS",
+        "class_name": "Conversation"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Conversation"
+      ]
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  },
+  "build": {
+    "command": "node build.mjs",
+    "watch_dir": [
+      "worker.js",
+      "engine.js",
+      "law.js",
+      "../src/prompt.js"
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "pooshong-cloudflare-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "deploy": "wrangler deploy",
+    "check": "wrangler deploy --dry-run --outdir .check",
+    "test": "node --test *.test.js"
+  },
+  "devDependencies": {
+    "wrangler": "4.136.1",
+    "esbuild": "0.28.1"
+  }
+}

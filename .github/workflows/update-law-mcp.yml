@@ -1,0 +1,227 @@
+name: Update and deploy korean-law-mcp
+
+on:
+  schedule:
+    # Daily at 05:37 KST (20:37 UTC); GitHub schedules can be delayed.
+    - cron: '37 20 * * *'
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: Revalidate and redeploy even when the version is already deployed
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: korean-law-mcp-production-update
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      deploy: ${{ steps.plan.outputs.deploy }}
+      base_sha: ${{ steps.plan.outputs.base_sha }}
+      target: ${{ steps.check.outputs.target }}
+    steps:
+      - name: Require the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+            echo '::error::Run this workflow from the default branch only.'
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Check the stable npm release
+        id: check
+        run: node scripts/update-law-mcp.mjs --check
+      - name: Compare the last successful deployment
+        id: plan
+        env:
+          TARGET_VERSION: ${{ steps.check.outputs.target }}
+          DEPENDENCY_CHANGED: ${{ steps.check.outputs.changed }}
+          FORCE_DEPLOY: ${{ inputs.force_deploy || false }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+          import { deploymentNeeded } from './scripts/update-law-mcp.mjs';
+          const marker = '.github/law-mcp-deployed-version.txt';
+          const deployed = existsSync(marker) ? readFileSync(marker, 'utf8').trim() : null;
+          const deploy = process.env.DEPENDENCY_CHANGED === 'true' || deploymentNeeded({target: process.env.TARGET_VERSION, deployed, force: process.env.FORCE_DEPLOY === 'true'});
+          appendFileSync(process.env.GITHUB_OUTPUT, `deploy=${deploy}\n`);
+          if (!deploy) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `korean-law-mcp ${deployed} is already deployed. No installation, tests, or deployment were needed.\n`);
+          NODE
+          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Install, test, and dry-run the selected version
+        if: steps.plan.outputs.deploy == 'true'
+        env:
+          TARGET_VERSION: ${{ steps.check.outputs.target }}
+        run: node scripts/update-law-mcp.mjs --verify-current "--target=$TARGET_VERSION"
+      - name: Refuse unrelated tracked changes
+        if: steps.plan.outputs.deploy == 'true'
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync } from 'node:child_process';
+          const changed = execFileSync('git', ['diff', 'HEAD', '--name-only', '-z'], {encoding: 'utf8'}).split('\0').filter(Boolean);
+          if (changed.some(name => !['package.json', 'package-lock.json'].includes(name))) {
+            throw new Error('Validation changed unrelated tracked files; refusing the update.');
+          }
+          NODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.plan.outputs.deploy == 'true'
+        with:
+          name: validated-law-dependency
+          path: |
+            package.json
+            package-lock.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # A fresh runner receives JSON only. New dependency code never receives a write token.
+  commit:
+    needs: validate
+    if: needs.validate.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: validated-law-dependency
+          path: ${{ runner.temp }}/validated-law-dependency
+      - name: Validate and commit the tested manifests
+        id: commit
+        env:
+          EXPECTED_SHA: ${{ needs.validate.outputs.base_sha }}
+          TARGET_VERSION: ${{ needs.validate.outputs.target }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ARTIFACT_DIR: ${{ runner.temp }}/validated-law-dependency
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$EXPECTED_SHA" ]; then
+            echo '::error::The default branch changed during validation. Rerun the workflow; nothing was deployed.'
+            exit 1
+          fi
+          node --input-type=module <<'NODE'
+          import { readFileSync, copyFileSync } from 'node:fs';
+          import path from 'node:path';
+          import { validateCandidate } from './scripts/update-law-mcp.mjs';
+          const original = JSON.parse(readFileSync('package.json', 'utf8'));
+          const manifestPath = path.join(process.env.ARTIFACT_DIR, 'package.json');
+          const lockPath = path.join(process.env.ARTIFACT_DIR, 'package-lock.json');
+          validateCandidate(original, JSON.parse(readFileSync(manifestPath, 'utf8')), JSON.parse(readFileSync(lockPath, 'utf8')), process.env.TARGET_VERSION);
+          copyFileSync(manifestPath, 'package.json');
+          copyFileSync(lockPath, 'package-lock.json');
+          NODE
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- package.json package-lock.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update korean-law-mcp to $TARGET_VERSION"
+            # No force push or automatic rebase: a race/branch rule must stop deployment.
+            git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # Fresh installation avoids carrying test-runner state into the deployment runner.
+  deploy:
+    needs: [validate, commit]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require deployment credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_WORKER_NAME: ${{ secrets.CLOUDFLARE_WORKER_NAME }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ] || [ -z "$CLOUDFLARE_WORKER_NAME" ]; then
+            echo '::error::Repository Actions Secrets에 CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_WORKER_NAME을 설정하세요. 배포하지 않았으며 성공 표시는 변경하지 않았습니다.'
+            exit 1
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.commit.outputs.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Install the committed lockfiles without lifecycle scripts
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm --prefix cloudflare ci --ignore-scripts --no-audit --no-fund
+      - name: Stop if the default branch moved before deployment
+        env:
+          EXPECTED_SHA: ${{ needs.commit.outputs.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          if [ "$(git rev-parse FETCH_HEAD)" != "$EXPECTED_SHA" ]; then
+            echo '::error::The default branch changed before deployment. Rerun the workflow.'
+            exit 1
+          fi
+      - name: Deploy the validated Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_WORKER_NAME: ${{ secrets.CLOUDFLARE_WORKER_NAME }}
+          WRANGLER_SEND_METRICS: 'false'
+        run: |
+          # 운영 주소와 배포 식별자가 포함된 원문은 임시 파일에만 저장합니다.
+          umask 077
+          deploy_log="$RUNNER_TEMP/law-mcp-worker-deploy.log"
+          if npm --prefix cloudflare run deploy -- --name "$CLOUDFLARE_WORKER_NAME" > "$deploy_log" 2>&1; then
+            echo 'Worker 배포 성공 (exit 0).'
+          else
+            deploy_status=$?
+            echo "::error::Worker 배포 실패 (exit $deploy_status)."
+            exit "$deploy_status"
+          fi
+
+  record-success:
+    needs: [validate, commit, deploy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Record the successfully deployed version
+        env:
+          EXPECTED_SHA: ${{ needs.commit.outputs.sha }}
+          TARGET_VERSION: ${{ needs.validate.outputs.target }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$(git rev-parse HEAD)" != "$EXPECTED_SHA" ]; then
+            echo '::error::Deployment succeeded but the default branch changed. The deployment marker was not saved; rerun to reconcile.'
+            exit 1
+          fi
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from 'node:fs';
+          import { releaseVersion } from './scripts/update-law-mcp.mjs';
+          writeFileSync('.github/law-mcp-deployed-version.txt', releaseVersion(process.env.TARGET_VERSION) + '\n');
+          NODE
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- .github/law-mcp-deployed-version.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: record deployed korean-law-mcp $TARGET_VERSION"
+            git push origin "HEAD:refs/heads/$DEFAULT_BRANCH"
+          fi
+          echo "Validated and deployed korean-law-mcp $TARGET_VERSION. The deployment marker is current." >> "$GITHUB_STEP_SUMMARY"

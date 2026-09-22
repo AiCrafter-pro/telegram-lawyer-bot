@@ -1,0 +1,8 @@
+node_modules/
+.dev.vars
+.dev.vars.*
+.wrangler/
+.build/
+*.secret.json
+.check/
+!.dev.vars.example

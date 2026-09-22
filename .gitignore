@@ -1,0 +1,23 @@
+node_modules/
+logs/
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.wrangler/
+.build/
+.check/
+dist/
+*.secret.json
+__pycache__/
+*.log
+.DS_Store
+docs/
+archive/
+
+# Local-only operational records and recovery backups
+.local/
+cloudflare/deployment.json
+cloudflare/wrangler.local.jsonc
